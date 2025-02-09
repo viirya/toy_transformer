@@ -212,7 +212,7 @@ fn main() {
         // 多頭注意力 (Multi-Head Attention, MHA) 的反向傳播
         let grad_w_o = attn_output.t().dot(&grad_a);
 
-        let grad_attention = grad_output.dot(&w_o.t());
+        let grad_attention = grad_a.dot(&w_o.t());
 
         let grad_attention_heads: Vec<Array2<f32>> = grad_attention
             .axis_chunks_iter(Axis(1), d_head)
@@ -241,7 +241,6 @@ fn main() {
         // println!("grad_w1.shape: {:?}", grad_w1.shape());
         // println!("grad_w2.shape: {:?}", grad_w2.shape());
 
-        sgd_update(&mut w1, &grad_w1, lr);
         sgd_update(&mut w1, &grad_w1, lr);
         sgd_update(&mut w2, &grad_w2, lr);
         sgd_update_3dim(&mut w_q, &grad_w_q, lr);
