@@ -1,4 +1,4 @@
-use ndarray::{s, Array, Array2, Array3, Axis, concatenate};
+use ndarray::{s, stack, Array, Array2, Array3, Axis, concatenate};
 use ndarray_rand::RandomExt;
 use ndarray_rand::rand_distr::Uniform;
 
@@ -21,9 +21,13 @@ fn attention(q: &Array2<f32>, k: &Array2<f32>, v: &Array2<f32>) -> Array2<f32> {
     attn_weights.dot(v)
 }
 
-fn feed_forward(x: &Array2<f32>, w1: &Array2<f32>, w2: &Array2<f32>) -> Array2<f32> {
+fn feed_forward(x: &Array2<f32>, w1: &Array2<f32>, w2: &Array2<f32>) -> (Array2<f32>, Array2<f32>) {
+    // H = ReLU(X x W1)
     let hidden = x.dot(w1).mapv(|x| x.max(0.0)); // ReLU
-    hidden.dot(w2)
+    // Y = H x W2
+    let y = hidden.dot(w2);
+
+    (y, hidden)
 }
 
 fn layer_norm(x: &Array2<f32>) -> Array2<f32> {
@@ -34,10 +38,14 @@ fn layer_norm(x: &Array2<f32>) -> Array2<f32> {
 
 fn multi_head_attention(
     x: &Array2<f32>, w_q: &Array3<f32>, w_k: &Array3<f32>, w_v: &Array3<f32>, w_o: &Array2<f32>
-) -> Array2<f32> {
+) -> (Array2<f32>, Vec<Array2<f32>>, Vec<Array2<f32>>, Vec<Array2<f32>>, Vec<Array2<f32>>) {
     let (heads, d_model, d_head) = (w_q.shape()[0], w_q.shape()[1], w_q.shape()[2]);
 
     let mut head_outputs = Vec::new();
+    let mut all_attn_weights = Vec::new();
+    let mut all_q = Vec::new();
+    let mut all_k = Vec::new();
+    let mut all_v = Vec::new();
     for h in 0..heads {
         let q = x.dot(&w_q.slice(s![h, .., ..]));
         let k = x.dot(&w_k.slice(s![h, .., ..]));
@@ -48,11 +56,15 @@ fn multi_head_attention(
         let attn_weights = softmax(&scores);
         let attn_output = attn_weights.dot(&v);
 
+        all_q.push(q);
+        all_k.push(k);
+        all_v.push(v);
+        all_attn_weights.push(attn_weights);
         head_outputs.push(attn_output);
     }
 
     let multi_head_output = concatenate(Axis(1), &head_outputs.iter().map(|o| o.view()).collect::<Vec<_>>()).unwrap();
-    multi_head_output.dot(w_o)
+    (multi_head_output.dot(w_o), all_attn_weights, all_q, all_k, all_v)
 }
 
 fn positional_encoding(seq_len: usize, d_model: usize) -> Array2<f32> {
@@ -73,26 +85,43 @@ fn positional_encoding(seq_len: usize, d_model: usize) -> Array2<f32> {
 fn transformer_block(
     x: &Array2<f32>, w_q: &Array3<f32>, w_k: &Array3<f32>, w_v: &Array3<f32>, w_o: &Array2<f32>,
     w1: &Array2<f32>, w2: &Array2<f32>
-) -> Array2<f32> {
+) -> (Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>, Vec<Array2<f32>>, Vec<Array2<f32>>, Vec<Array2<f32>>, Vec<Array2<f32>>) {
     // 1. 多頭注意力
-    let attn_output = multi_head_attention(x, w_q, w_k, w_v, w_o);
+    let (attn_output, all_attn_weights, all_q, all_k, all_v) = multi_head_attention(x, w_q, w_k, w_v, w_o);
 
     // 2. 殘差 + LayerNorm
     let attn_residual = layer_norm(&(x + &attn_output));
 
     // 3. 前饋網絡 (FFN)
-    let ffn_output = feed_forward(&attn_residual, w1, w2);
+    let (ffn_output, hidden) = feed_forward(&attn_residual, w1, w2);
 
     // 4. 最終的殘差 + LayerNorm
-    layer_norm(&(attn_residual + ffn_output))
+    (layer_norm(&(attn_residual.clone() + ffn_output)), attn_output, attn_residual, hidden, all_attn_weights, all_q, all_k, all_v)
 }
 
+/// 均方誤差 (Mean Squared Error, MSE)
+fn mean_squared_error(pred: &Array2<f32>, target: &Array2<f32>) -> f32 {
+    let diff = pred - target;
+    diff.mapv(|x| x.powi(2)).mean().unwrap()
+}
+
+/// 梯度下降更新函數 (SGD)
+fn sgd_update(param: &mut Array2<f32>, grad: &Array2<f32>, lr: f32) {
+    *param -= &(grad * lr);
+}
+
+fn sgd_update_3dim(param: &mut Array3<f32>, grad: &Array3<f32>, lr: f32) {
+    *param -= &(grad * lr);
+}
 
 fn main() {
     let seq_len = 4;  // 序列長度
     let d_model = 8;  // 每個 token 的維度
     let num_heads = 2;
     let d_head = d_model / num_heads;
+
+    let lr = 0.0001;
+    let epochs = 10000;
 
     // 隨機初始化 embedding (假設 vocab_size = 10)
      let embedding = Array2::random((10, d_model), Uniform::new(-0.1, 0.1));
@@ -111,11 +140,10 @@ fn main() {
     // let w_v = Array::random((d_model, d_model), Uniform::new(-0.1, 0.1));
 
     // 初始化多頭注意力參數
-    let w_q = Array::random((num_heads, d_model, d_head), Uniform::new(-0.1, 0.1));
-    let w_k = Array::random((num_heads, d_model, d_head), Uniform::new(-0.1, 0.1));
-    let w_v = Array::random((num_heads, d_model, d_head), Uniform::new(-0.1, 0.1));
-    let w_o = Array::random((d_model, d_model), Uniform::new(-0.1, 0.1));
-
+    let mut w_q = Array::random((num_heads, d_model, d_head), Uniform::new(-0.1, 0.1));
+    let mut w_k = Array::random((num_heads, d_model, d_head), Uniform::new(-0.1, 0.1));
+    let mut w_v = Array::random((num_heads, d_model, d_head), Uniform::new(-0.1, 0.1));
+    let mut w_o = Array::random((d_model, d_model), Uniform::new(-0.1, 0.1));
 
     // 計算 Attention
     // let q = input_embeds.dot(&w_q);
@@ -123,32 +151,106 @@ fn main() {
     // let v = input_embeds.dot(&w_v);
     // let attn_output = attention(&q, &k, &v);
 
+    // 前饋層參數
+    let mut w1 = Array::random((d_model, d_model * 2), Uniform::new(-0.1, 0.1));
+    let mut w2 = Array::random((d_model * 2, d_model), Uniform::new(-0.1, 0.1));
+
     let input_with_pe = &input_embeds + &pe;
 
-    /*
-    // 執行多頭注意力
-    let attn_output = multi_head_attention(&input_with_pe, &w_q, &w_k, &w_v, &w_o);
+    // 目標輸出
+    let target_output = Array::random((seq_len, d_model), Uniform::new(-0.1, 0.1));
 
-    // 加上殘差並做 LayerNorm
-    let attn_residual = layer_norm(&(input_with_pe + &attn_output));
+    for epoch in 0..epochs {
+        /*
+        // 執行多頭注意力
+        let attn_output = multi_head_attention(&input_with_pe, &w_q, &w_k, &w_v, &w_o);
 
-    // 前饋層參數
-    let w1 = Array::random((d_model, d_model * 2), Uniform::new(-0.1, 0.1));
-    let w2 = Array::random((d_model * 2, d_model), Uniform::new(-0.1, 0.1));
+        // 加上殘差並做 LayerNorm
+        let attn_residual = layer_norm(&(input_with_pe + &attn_output));
 
-    // 前饋網絡
-    let ffn_output = feed_forward(&attn_residual, &w1, &w2);
+        // 前饋層參數
+        let w1 = Array::random((d_model, d_model * 2), Uniform::new(-0.1, 0.1));
+        let w2 = Array::random((d_model * 2, d_model), Uniform::new(-0.1, 0.1));
 
-    // 最終的 Residual + LayerNorm
-    let output = layer_norm(&(attn_residual + ffn_output));
-     */
+        // 前饋網絡
+        let ffn_output = feed_forward(&attn_residual, &w1, &w2);
 
-    // 前饋層參數
-    let w1 = Array::random((d_model, d_model * 2), Uniform::new(-0.1, 0.1));
-    let w2 = Array::random((d_model * 2, d_model), Uniform::new(-0.1, 0.1));
+        // 最終的 Residual + LayerNorm
+        let output = layer_norm(&(attn_residual + ffn_output));
+         */
 
-    // 執行 Transformer Block
-    let output = transformer_block(&input_with_pe, &w_q, &w_k, &w_v, &w_o, &w1, &w2);
 
-    println!("Final Transformer Output:\n{:?}", output);
+        // 執行 Transformer Block
+        let (output, attn_output, attn_residual, hidden, all_attn_weights, all_q, all_k, all_v) = transformer_block(&input_with_pe, &w_q, &w_k, &w_v, &w_o, &w1, &w2);
+        // println!("output.shape: {:?}", output.shape());
+
+        let loss = mean_squared_error(&output, &target_output);
+
+        // 反向傳播 (Backpropagation) 訓練
+
+        // 計算 FFN 的反向傳播
+        let grad_output = 2.0 * (&output - &target_output) / (seq_len as f32);
+        // println!("grad_output.shape: {:?}", grad_output.shape());
+
+        // 計算 W2 梯度
+        let grad_w2 = hidden.t().dot(&grad_output);
+        // 計算 H 的梯度
+        let grad_h = grad_output.dot(&w2.t());
+
+        // 計算 ReLU 導數
+        let relu_deriv = hidden.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 });
+        let grad_h_relu = &grad_h * &relu_deriv;
+
+        // 計算 W1 梯度
+        let grad_w1 = attn_residual.t().dot(&grad_h_relu);
+
+        // 計算 A' 的梯度
+        // (簡化) 計算 A 的梯度
+        let grad_a_residual = grad_h_relu.dot(&w1.t());
+        let grad_a = grad_a_residual.clone();
+
+        // 多頭注意力 (Multi-Head Attention, MHA) 的反向傳播
+        let grad_w_o = attn_output.t().dot(&grad_a);
+
+        let grad_attention = grad_output.dot(&w_o.t());
+
+        let grad_attention_heads: Vec<Array2<f32>> = grad_attention
+            .axis_chunks_iter(Axis(1), d_head)
+            .map(|chunk| chunk.to_owned())
+            .collect();
+
+        let mut grad_w_q_heads = Vec::new();
+        let mut grad_w_k_heads = Vec::new();
+        let mut grad_w_v_heads = Vec::new();
+        for h in 0..num_heads {
+            let grad_attention_h = &grad_attention_heads[h];
+            let grad_v_h = all_attn_weights[h].t().dot(grad_attention_h);
+            let grad_s_h = grad_attention_h.dot(&all_v[h].t());
+            let grad_q_h = grad_s_h.dot(&all_k[h]) / (d_head as f32).sqrt();
+            let grad_k_h = grad_s_h.t().dot(&all_q[h]) / (d_head as f32).sqrt();
+
+            grad_w_q_heads.push(input_with_pe.t().dot(&grad_q_h));
+            grad_w_k_heads.push(input_with_pe.t().dot(&grad_k_h));
+            grad_w_v_heads.push(input_with_pe.t().dot(&grad_v_h));
+        }
+
+        let grad_w_q = stack(Axis(0), &grad_w_q_heads.iter().map(|x| x.view()).collect::<Vec<_>>()).unwrap();
+        let grad_w_k = stack(Axis(0), &grad_w_k_heads.iter().map(|x| x.view()).collect::<Vec<_>>()).unwrap();
+        let grad_w_v = stack(Axis(0), &grad_w_v_heads.iter().map(|x| x.view()).collect::<Vec<_>>()).unwrap();
+
+        // println!("grad_w1.shape: {:?}", grad_w1.shape());
+        // println!("grad_w2.shape: {:?}", grad_w2.shape());
+
+        sgd_update(&mut w1, &grad_w1, lr);
+        sgd_update(&mut w1, &grad_w1, lr);
+        sgd_update(&mut w2, &grad_w2, lr);
+        sgd_update_3dim(&mut w_q, &grad_w_q, lr);
+        sgd_update_3dim(&mut w_k, &grad_w_k, lr);
+        sgd_update_3dim(&mut w_v, &grad_w_v, lr);
+        sgd_update(&mut w_o, &grad_w_o, lr);
+
+        println!("Epoch: {}, Loss: {:.6}", epoch, loss);
+    }
+
+    // println!("Final Transformer Output:\n{:?}", output);
 }
