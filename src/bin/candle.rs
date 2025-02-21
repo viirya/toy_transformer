@@ -1,5 +1,5 @@
 use candle_core::{Module, Tensor, DType, Device, Result, Var};
-use candle_nn::{linear, Embedding, LayerNorm, Linear, Optimizer, VarBuilder, SGD};
+use candle_nn::{embedding, linear, Embedding, LayerNorm, Linear, Optimizer, VarBuilder, VarMap, SGD};
 use candle_nn::init::{ONE, ZERO};
 use candle_nn::ops::softmax;
 
@@ -61,8 +61,8 @@ struct FeedForward {
 impl FeedForward {
     fn new(vb: &VarBuilder, embed_dim: usize, hidden_dim: usize) -> Result<Self> {
         Ok(Self {
-            fc1: linear(embed_dim, hidden_dim, vb.clone())?,
-            fc2: linear(hidden_dim, embed_dim, vb.clone())?,
+            fc1: linear(embed_dim, hidden_dim, vb.pp("fc1"))?,
+            fc2: linear(hidden_dim, embed_dim, vb.pp("fc2"))?,
         })
     }
 
@@ -96,8 +96,8 @@ impl TransformerBlock {
         let eps = 1e-5;
 
         Ok(Self {
-            mha: MultiHeadSelfAttention::new(vb, embed_dim, num_heads)?,
-            ffn: FeedForward::new(vb, embed_dim, ffn_dim)?,
+            mha: MultiHeadSelfAttention::new(&vb.pp("mhsa"), embed_dim, num_heads)?,
+            ffn: FeedForward::new(&vb.pp("ff"), embed_dim, ffn_dim)?,
             norm1: LayerNorm::new(weight1, bias1, eps),
             norm2: LayerNorm::new(weight2, bias2, eps),
         })
@@ -134,14 +134,13 @@ struct Transformer {
 impl Transformer {
     fn new(vb: &VarBuilder, vocab_size: usize, embed_dim: usize, num_heads: usize, num_layers: usize, ffn_dim: usize) -> Result<Self> {
         let mut layers = Vec::new();
-        for _ in 0..num_layers {
-            layers.push(TransformerBlock::new(vb, embed_dim, num_heads, ffn_dim)?);
+        for l in 0..num_layers {
+            layers.push(TransformerBlock::new(&vb.pp(format!("layer_{}", l)), embed_dim, num_heads, ffn_dim)?);
         }
 
-        let embeddings = Tensor::randn(0.0f32, 5.0f32, (vocab_size, embed_dim), &Device::Cpu)?;
         Ok(Self {
             layers,
-            embedding: Embedding::new(embeddings, embed_dim),
+            embedding: embedding(vocab_size, embed_dim, vb.clone())?,
         })
     }
 
@@ -168,13 +167,15 @@ impl Transformer {
 
 fn main() -> Result<()> {
     let device = Device::Cpu;
-    let vb = VarBuilder::zeros(DType::F32, &device);
+    let varmap = VarMap::new();
+    let vb = crate::VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
     let transformer = Transformer::new(&vb, 10000, 256, 8, 6, 512)?;
     let vars = transformer.parameters()?;
 
     let input = Tensor::rand(0.0, 10000.0, (8, 32), &device)?
         .abs()?
-        .broadcast_mul(&Tensor::from_slice(&[10000.0], (1,), &device)?)?
+        .broadcast_mul(&Tensor::from_slice(&[1.0], (1,), &device)?)?
         .to_dtype(DType::U32)?
         .clamp(0u32, 9999u32)?;
 
@@ -182,10 +183,11 @@ fn main() -> Result<()> {
 
     let target = Tensor::rand(0.0, 10000.0, (8, 32), &device)?
         .abs()?
-        .broadcast_mul(&Tensor::from_slice(&[10000.0], (1,), &device)?)?
+        .broadcast_mul(&Tensor::from_slice(&[1.0], (1,), &device)?)?
         .to_dtype(DType::U32)?
         .clamp(0u32, 9999u32)?;
 
+    let target = transformer.embedding(&target)?;
 
     let mut sgd = SGD::new(vars, 0.01)?;
 
@@ -193,10 +195,6 @@ fn main() -> Result<()> {
         let output = transformer.forward(&input)?;
 
         println!("output.shape: {:?}", output.shape());
-
-        let target = transformer.embedding(&target)?;
-
-        println!("target.shape: {:?}", target.shape());
 
         let loss = (&output - &target)?.sqr()?.mean(2)?;
 
